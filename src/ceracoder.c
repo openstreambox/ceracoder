@@ -25,6 +25,7 @@
 #include <signal.h>
 #include <time.h>
 #include <errno.h>
+#include <unistd.h>
 
 #include <gst/gst.h>
 #include <gst/gstinfo.h>
@@ -45,6 +46,8 @@
 #include "bitrate_control.h"
 #include "sd_notify.h"
 #include "frame_liveness.h"
+#include "quality_counters.h"
+#include "quality_probe.h"
 
 // SRT ACK timeout
 #define SRT_ACK_TIMEOUT 6000 // maximum interval between received ACKs before the connection is TOed
@@ -115,6 +118,21 @@ static volatile sig_atomic_t exit_code = EXIT_SUCCESS;
  * withholds WATCHDOG=1 and systemd respawns the process.
  */
 static FrameLiveness frame_liveness;
+
+/*
+ * Quality counters (frames into the encoder, videorate repeats and drops, time
+ * at the minimum bitrate, sender latency) and the optional stats file they are
+ * written to once per second (CERACODER_STATS_FILE). The file is opt-in, like
+ * the other environment overrides, so the CLI and TS bindings stay unchanged.
+ */
+static QualityCounters quality;
+static const char *stats_file_path = NULL;
+static uint64_t quality_start_ms = 0;
+static uint64_t pattern_epoch_ms = 0;
+static SRT_TRACEBSTATS last_srt_stats;
+static int last_srt_stats_valid = 0;
+static uint64_t fps_prev_frames = 0;
+static uint64_t fps_prev_ms = 0;
 
 // Forward declarations for the reconnect machinery.
 static void srt_reconnect_start(void);
@@ -343,6 +361,8 @@ void do_bitrate_update(SRT_TRACEBSTATS *stats, uint64_t ctime) {
 
   // Call the balancer algorithm
   BalancerOutput output = balancer_runner_step(&balancer_runner, &input);
+  quality_bitrate_sample(&quality, ctime, output.new_bitrate,
+                         config_bitrate_bps(g_config.min_bitrate));
 
   // Update the overlay display
   overlay_ui_update(&overlay_ui, output.new_bitrate, output.throughput,
@@ -426,6 +446,62 @@ static void srt_reconnect_start(void) {
   g_timeout_add((guint)backoff, srt_reconnect_attempt_cb, NULL);
 }
 
+static uint64_t wall_ms(void) {
+  struct timespec ts = {0, 0};
+  clock_gettime(CLOCK_REALTIME, &ts);
+  return ((uint64_t)ts.tv_sec * 1000) + ((uint64_t)ts.tv_nsec / 1000000);
+}
+
+/* Write the quality snapshot atomically (temp file, then rename). */
+gboolean stats_file_write(gpointer user_data) {
+  (void)user_data;
+  if (stats_file_path == NULL) return FALSE;
+
+  QualitySnapshot snap;
+  memset(&snap, 0, sizeof(snap));
+  uint64_t now = getms();
+  snap.time_ms = wall_ms();
+  snap.uptime_ms = now - quality_start_ms;
+  snap.pattern_epoch_ms = pattern_epoch_ms;
+  snap.encoder_frames = quality_encoder_frames(&quality);
+  snap.fps_measured = -1;
+  if (fps_prev_ms != 0 && now > fps_prev_ms) {
+    snap.fps_measured = (double)(snap.encoder_frames - fps_prev_frames) * 1000.0 /
+                        (double)(now - fps_prev_ms);
+  }
+  fps_prev_frames = snap.encoder_frames;
+  fps_prev_ms = now;
+  quality_collect(gst_pipeline, &snap);
+  snap.bitrate_bps = encoder_ctrl.current_bitrate;
+  snap.min_bitrate_bps = config_bitrate_bps(g_config.min_bitrate);
+  snap.max_bitrate_bps = config_bitrate_bps(g_config.max_bitrate);
+  snap.at_min_ms = quality.at_min_ms;
+  snap.latency_valid = quality_latency_take(&quality, &snap.latency_last_ms,
+                                            &snap.latency_avg_ms, &snap.latency_max_ms);
+  if (last_srt_stats_valid && !reconnect_is_reconnecting(&reconnect_ctrl)) {
+    snap.srt_valid = 1;
+    snap.srt_rtt_ms = last_srt_stats.msRTT;
+    snap.srt_send_buffer_ms = last_srt_stats.msSndBuf;
+    snap.srt_latency_ms = srt_latency_ms;
+    snap.srt_pkt_snd_drop_total = last_srt_stats.pktSndDropTotal;
+    snap.srt_pkt_snd_loss_total = last_srt_stats.pktSndLossTotal;
+    snap.srt_pkt_retrans_total = last_srt_stats.pktRetransTotal;
+  }
+
+  char json[2048];
+  int n = quality_snapshot_json(&snap, json, sizeof(json));
+  if (n < 0) return TRUE;
+  char tmp[4096];
+  snprintf(tmp, sizeof(tmp), "%s.tmp", stats_file_path);
+  FILE *f = fopen(tmp, "w");
+  if (f == NULL) return TRUE;
+  int ok = fwrite(json, 1, (size_t)n, f) == (size_t)n;
+  ok = (fclose(f) == 0) && ok;
+  if (ok) rename(tmp, stats_file_path);
+  else unlink(tmp);
+  return TRUE;
+}
+
 gboolean connection_housekeeping(gpointer user_data) {
   (void)user_data;
   if (quit) return TRUE;
@@ -448,6 +524,8 @@ gboolean connection_housekeeping(gpointer user_data) {
   SRT_TRACEBSTATS stats;
   int ret = srt_client_get_stats(&srt_client, &stats);
   if (ret != 0) goto r;
+  last_srt_stats = stats;
+  last_srt_stats_valid = 1;
 
   // Track when the most recent ACK was received
   if (stats.pktRecvACKTotal != prev_ack_count) {
@@ -492,6 +570,7 @@ GstFlowReturn new_buf_cb(GstAppSink *sink, gpointer user_data) {
   GstMapInfo map = {0};
 
   buffer = gst_sample_get_buffer(sample);
+  quality_record_buffer_latency(GST_ELEMENT(sink), buffer, &quality);
   gst_buffer_map(buffer, &map, GST_MAP_READ);
 
   // Send srt_pkt_size packets, splitting and merging samples if needed
@@ -763,6 +842,12 @@ int main(int argc, char** argv) {
     encoder_control_set_bitrate(&encoder_ctrl, config_bitrate_bps(g_config.max_bitrate));
   }
 
+  quality_start_ms = getms();
+  quality_counters_init(&quality, quality_start_ms);
+  quality_install_encoder_probe(gst_pipeline, &quality);
+  stats_file_path = getenv("CERACODER_STATS_FILE");
+  if (stats_file_path != NULL && stats_file_path[0] == '\0') stats_file_path = NULL;
+
   // Initialize overlay
   overlay_ui_init(&overlay_ui, gst_pipeline);
   overlay_ui_update(&overlay_ui, 0,0,0,0,0,0,0,0,0);
@@ -853,6 +938,12 @@ int main(int argc, char** argv) {
   unsigned long fl_stall_ms = (unsigned long)env_long(
       "CERACODER_FRAME_STALL_MS", FRAME_LIVENESS_DEFAULT_STALL_MS, 100, 600000);
   frame_liveness_init(&frame_liveness, fl_stall_ms, getms());
+
+  // Test pattern only: put the wall-clock time of frame 0 into the picture.
+  pattern_epoch_ms = quality_pattern_clock_setup(gst_pipeline);
+  if (stats_file_path != NULL) {
+    g_timeout_add(1000, stats_file_write, NULL);
+  }
 
   // Start pipeline
   gst_element_set_state((GstElement*)gst_pipeline, GST_STATE_PLAYING);
