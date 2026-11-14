@@ -397,6 +397,7 @@ def frame_accounting(frames, fps):
     res = {"sent": 0, "arrived": 0, "repeated": 0, "missing": 0, "reordered": 0,
            "garbled": 0, "restarts": 0, "gaps": [], "repeat_runs": [], "restart_times": []}
     readable = [i for i, f in enumerate(frames) if f["code"] is not None]
+    res["garbled_idx"] = []
 
     def persistent_epoch(pos, ep):
         nxt = [frames[j]["epoch"] for j in readable[pos:pos + 10]]
@@ -430,6 +431,7 @@ def frame_accounting(frames, fps):
                 res["time_jumps"] = res.get("time_jumps", 0) + 1
             else:
                 res["garbled"] += 1
+                res["garbled_idx"].append(i)
                 continue
         d = c - seg["last_c"]
         if d == 0:
@@ -611,20 +613,23 @@ def analyse_audio(rec, workdir, info):
         silences.append((c, s, dur_total - s))
 
     # beep onsets: 2 kHz fit on L+R, 4 ms windows, then 1 ms refinement
-    mono = array("f", map(lambda a, b: a + b, left, right))
     W4 = 192
     f2k = ToneFitter(L.BEEP_HZ, W4)
+
+    def beep_amp(j):
+        # 2 kHz amplitude per channel, added: an inverted channel can't cancel it
+        return f2k.fit(left[j:j + W4])[0] + f2k.fit(right[j:j + W4])[0]
     thr = 0.6 * L.BEEP_AMP  # summed beep is 2x BEEP_AMP; still found with one channel muted
     onsets = []
     i = 0
     last = -SR
     while i + W4 <= n:
-        a, _ = f2k.fit(mono[i:i + W4])
+        a = beep_amp(i)
         if a > thr and i - last > SR // 2:
             j0 = max(0, i - W4)
             j = j0
             while j + W4 <= n and j <= i:
-                a2, _ = f2k.fit(mono[j:j + W4])
+                a2 = beep_amp(j)
                 if a2 > thr:
                     break
                 j += SR // 1000
@@ -634,7 +639,7 @@ def analyse_audio(rec, workdir, info):
             # second, and the centre is immune to ramps and level changes).
             k = j + W4
             while k + W4 <= n:
-                a3, _ = f2k.fit(mono[k:k + W4])
+                a3 = beep_amp(k)
                 if a3 < thr:
                     break
                 k += SR // 1000
@@ -946,7 +951,8 @@ def report(args):
         acc = frame_accounting(frames, fps)
         still, still_at = longest_still(frames, fps)
         dmg = damage_flags(frames)
-        damaged = [i for i, d in enumerate(dmg) if d > 12]
+        damaged = sorted(set(i for i, d in enumerate(dmg) if d > 12)
+                         | set(acc["garbled_idx"]) | {i for i, f in enumerate(frames) if f["code"] is None})
         unreadable = sum(1 for f in frames if f["code"] is None)
         green = [f["t"] for f in frames if is_green(f["y"], f["u"], f["v"])]
         green_part = [f["t"] for f in frames
@@ -991,25 +997,30 @@ def report(args):
             rr = runs_of(damaged, 2)
             longest = max(frames[e]["t"] - frames[s]["t"] + 1 / fps for s, e in rr)
             facts["broken_longest_s"] = round(longest, 2)
-            problems.append(f"Broken picture: {len(damaged)} frames with grey or smeared blocks in {len(rr)} "
+            problems.append(f"Broken picture: {len(damaged)} frames with grey or smeared blocks or a damaged "
+                            f"frame number, in {len(rr)} "
                             f"places (first at {fmt_t(rel(frames[rr[0][0]]['t']))}, longest {longest:.1f} s). "
                             "Usually lost data; it clears at the next keyframe.")
         else:
             fine.append("no broken pictures")
         facts["garbled"] = acc["garbled"]
-        if (unreadable + acc["garbled"]) > len(frames) * 0.02 and not damaged:
-            problems.append(f"{fmt_n(unreadable + acc['garbled'])} frames had an unreadable or damaged "
-                            "frame number (broken picture).")
         # passive estimates that also work without the pattern
         if v["mpdecimate_kept"] is not None and all_frames:
             facts["mpdecimate_dropped"] = len(all_frames) - v["mpdecimate_kept"]
-        if v["blocks"]:
-            bl = [b for t, b in v["blocks"] if cut <= t <= end]
-            if bl:
-                facts["blockiness"] = round(statistics.median(bl), 2)
-                if statistics.median(bl) > args.block_limit:
-                    problems.append(f"Blocky picture (blockdetect {statistics.median(bl):.1f}, clean pattern "
-                                    f"stays under {args.block_limit:g}): not enough bitrate for the picture.")
+        bl = [b for t, b in v["blocks"] if cut <= t <= end]
+        blk = statistics.median(bl) if bl else None
+        if blk is not None:
+            facts["blockiness"] = round(blk, 2)
+        vsecs = [per_sec[k] for k in per_sec if cut <= k <= end]
+        bpp = (statistics.median(vsecs) * 8 / (v["width"] * v["height"] * fps)) if vsecs and v["width"] else None
+        if bpp is not None:
+            facts["bits_per_pixel"] = round(bpp, 4)
+        if (blk is not None and blk > args.block_limit) or (bpp is not None and bpp < args.min_bpp):
+            problems.append("Blocky picture: not enough bitrate for the picture ("
+                            + (f"blockdetect {blk:.1f}, the clean pattern stays near 1; " if blk is not None else "")
+                            + (f"{statistics.median(vsecs) * 8 / 1000:,.0f} kbit/s for {v['width']}x{v['height']} "
+                               f"at {fps:g} fps is {bpp:.3f} bits per pixel" if bpp is not None else "")
+                            + ").")
         if v["idet"]:
             facts["idet"] = v["idet"]  # passive estimate; the pattern's sharp lines confuse it
         facts["field_mismatch"] = v["field_mismatch"]
@@ -1353,7 +1364,10 @@ def main():
                        help="seconds at the start that are not judged (default 3)")
         p.add_argument("--tail", type=float, default=1.0,
                        help="seconds at the end that are not judged (default 1)")
-        p.add_argument("--block-limit", type=float, default=6.0, help="blockdetect score that counts as blocky")
+        p.add_argument("--block-limit", type=float, default=1.8,
+                       help="blockdetect score on the noise patch that counts as blocky (clean runs: about 1.0-1.4)")
+        p.add_argument("--min-bpp", type=float, default=0.02,
+                       help="video bits per pixel below which the picture counts as starved")
         p.add_argument("--peak-ratio", type=float, default=2.5, help="per-second bitrate peak vs median")
         p.add_argument("--drift-limit", type=float, default=15.0, help="A/V drift in ms per minute")
         p.add_argument("--residual-limit", type=float, default=0.03,

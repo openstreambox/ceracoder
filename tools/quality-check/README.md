@@ -40,8 +40,10 @@ them to the decoded size).
 - **Colour bars** in the background: known patches for the range check.
 
 Only stock GStreamer elements are used (base, good, bad), all of which are in
-the device image. The compositor has about 130 small inputs; its CPU cost on
-the RK3588 has not been measured yet.
+the device image. Cost: on an x86 workstation the pattern's video takes about
+0.57 of a core against 0.09 for the old static pattern (compositor base 0.36,
+clock blocks 0.11, counter blocks 0.03, text 0.07). Drawing the counter and
+clock in C would remove most of it. The RK3588 cost has not been measured.
 
 ## Running it
 
@@ -57,17 +59,31 @@ tools/quality-check/analyse.py report /tmp/qc/rec.ts --arrivals /tmp/qc/arrivals
     --srt-stats /tmp/qc/srt-stats.json --sender-stats stats.jsonl [--srtla-stats srtla.jsonl]
 ```
 
-Example report (clean run):
+Example report (clean run of the x264 version over local SRT, latency 1000 ms):
 
 ```
-543 frames sent, 543 arrived, 0 repeated (0.0%).
-No green frames. Sound: no gaps, both channels, 50 ms behind the picture, steady. Keyframes every 2.0 s.
-End-to-end delay: 2.03 s from the pattern clock to the decoded picture (95% of frames within 2.05 s).
-Where it goes: encoder and sender pipeline 876 ms; network one way 0 ms; SRT latency buffer (TSBPD 1000 ms) 1000 ms; receiver demux and decode (the rest) 152 ms.
+591 frames sent, 591 arrived, 0 repeated (0.0%).
+No green frames. Sound: no gaps, both channels, 44 ms behind the picture, steady. Keyframes every 2.0 s.
+End-to-end delay: 1.45 s from the pattern clock to the decoded picture (95% of frames within 1.56 s).
+Where it goes: encoder and sender pipeline 187 ms; network one way (half the SRT round trip) 0 ms; SRT latency buffer (TSBPD 1000 ms) 1000 ms; receiver demux and decode (the rest) 260 ms.
+Stream clock: pictures are sent 161 ms ahead of their presentation time (PTS - PCR); a player that follows the stream clock buffers about that much.
 
-Checked and fine: no green frames, no broken pictures, ...
+Checked and fine: no green frames, no broken pictures, progressive picture, colour range, picture timestamps even, bitrate steady (peak 1.1x typical), channel polarity, clean sound (no clicks or distortion), levels (loudness -16 LUFS, no clipping), no SRT packet loss.
 Not judged: the first 3 s and the last 1 s.
 ```
+
+## Fault runs
+
+`faults/run_faults.py --out DIR` runs every case (about 25 minutes);
+`--only a,b` picks some, `--report-only` re-analyses existing recordings and
+`--list` shows them. Each case runs the real ceracoder in its own
+`unshare -rn` network namespace on the loopback interface, so netem, MTU
+changes and the SRTLA bond (`srtla_send` plus `srtla_rec`, with per-link
+netem by source address) need no root. Content faults are pipeline edits
+(videorate from another camera rate, an all-zero frame through a compositor
+input with a pad offset, channel matrices, gain, dropped sound buffers,
+relabelled sample rates); two receiver-side cases are made from the clean
+recording with ffmpeg.
 
 ## What the analyser checks
 
