@@ -5,3 +5,4 @@ export * from "./cli.js";
 export * from "./run.js";
 export * from "./process.js";
 export * from "./pipeline/index.js";
+export * from "./quality.js";

@@ -58,6 +58,7 @@ Run `git submodule init && git submodule update` if missing. `make submodule` do
 | SRT send logic | `src/net/srt_client.c` |
 | Pipeline loading | `src/io/pipeline_loader.c` |
 | TS bindings source | `bindings/typescript/src/` |
+| Quality test pattern, counters, analyser | [tools/quality-check/README.md](tools/quality-check/README.md) |
 
 ## ANTI-PATTERNS
 
